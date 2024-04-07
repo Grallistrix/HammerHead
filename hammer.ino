@@ -1,163 +1,279 @@
-//IR sensors
-#define Q1 12
-#define Q2 11
-#define Q3 8
-#define Q4 7
-#define Q5 4
+#include <Arduino.h>
+#include <QTRSensors.h>
+#include <EEPROM.h>
+#include <SoftwareSerial.h>
 
-//disable/enable motor driver
-#define SLP 2
+QTRSensors qtr;
+const uint8_t sensorCount = 8;
+uint16_t sensorValues[sensorCount];
 
-/*sterownie: aby lf jechał do przodu (patrząc od tyłu LF) prawy silnik ma się kręcić w prawo (na pin 5 podajemy sygnał PWM a pin 6 zwieramy do masy),
-  silnik lewy (na pin 10 sygnał PWM pin 9 do GND)
-*/
-//PWM control pins RM-right motor, LM-left motor, _l-left rotation
-#define RM_l 5
-#define RM_r 6
-#define LM_r 9
-#define LM_l 10            
+//Motor setup
+uint8_t motor_pins[4] = {5,6,9,10};
+//default
+uint8_t MOTOR_SPEED = 40;
+uint8_t MAX_SPEED = 80;
+//PID values
+uint16_t maxError = 3500;
+double lastError = 0;
+const int goal = 3500;
 
-bool motors_on = 0;
-const unsigned int MOTOR_SPEED = 70;
-const unsigned int MAX_SPEED = 160;
-const unsigned int MIN_SPEED = 0;
+//EEPROM
+float kP = 0.00f;
+float kD = 0.00f;
+float kI = 0.00f;
 
-//sensors reading
-int q1 = 0;
-int q2 = 0;
-int q3 = 0;
-int q4 = 0;
-int q5 = 0;
+int I = 0;
 
-int sum = 0;
-int prev_sum = 0;
+//startup flag
+bool flag = 0;
 
-int goal = 3500;
-int flag = 0;
-int error = 0;
+//encoder impulses
+volatile int count_l = 0;
+volatile int count_r = 0;
 
-float kP = MAX_SPEED / goal;
-float kD = kP * 10;
-float PID = 0.0;
-int reading = 0;
-int previous_error = 0;
-int P = 0;
-int D = 0;
 
-void setup() {
-    //Motors
-    pinMode(LM_l, OUTPUT);
-    pinMode(LM_r, OUTPUT);
-    pinMode(RM_r, OUTPUT);
-    pinMode(RM_l, OUTPUT);
-    //tact switch to start a program
-    pinMode(3, INPUT_PULLUP);
-    //driver enable/disable
-    pinMode(SLP, OUTPUT);
-    //IR sensors reading
-    pinMode(Q1, INPUT);
-    pinMode(Q2, INPUT);
-    pinMode(Q3, INPUT);
-    pinMode(Q4, INPUT);
-    pinMode(Q5, INPUT);
-    digitalWrite(SLP, HIGH);
-    digitalWrite(6, LOW);
-    digitalWrite(9, LOW);
-    //Serial.begin(9600);
+void calibration(void){
+
+    PORTB |= _BV(PORTB5);   //digitalWrite(LED_BUILTIN,LOW);
+    
+    for (uint16_t i = 0; i < 400; i++)
+        qtr.calibrate();
+    
+    PORTB &= ~_BV(PORTB5); //digitalWrite(LED_BUILTIN,HIGH);
+
+    //Printing raw values (max and min)
+    for (uint8_t i = 0; i < sensorCount; i++){
+        Serial1.print(qtr.calibrationOn.minimum[i]);
+        Serial1.print(' ');
+    }
+
+    Serial1.println();
+
+    for (uint8_t i = 0; i < sensorCount; i++){
+        Serial1.print(qtr.calibrationOn.maximum[i]);
+        Serial1.print(' ');
+    }
+    Serial1.println();
+    Serial1.println();
+    delay(1000);
+
 }
-void loop() {
-    if (digitalRead(3) == HIGH) //Skip loop if not powered on
-      return;
 
-      motors_on = 1;
-      digitalWrite(SLP, motors_on);
-      digitalWrite(6, LOW);
-      digitalWrite(9, LOW);
 
-      while (true) {
-          if (flag == 0) {
-                //rozpędzanie lf-a do MOTOR_SPEED na samym początku potem już stosowany jest algorytm PID - sugerowane zastąpienie funkcji delay() przerwaniem na timerach w ramach refaktoryzacji
-              for (float i = 0; i <= MOTOR_SPEED; i+=0.4) {
-                   analogWrite(5, i);
-                   analogWrite(10, i);
-                   delay(10);
-               }
-            }
-          else {
-              Reading();
-              if (reading == 777) {
-                  break;
-              }
-              PID_counter();
-              Movement();
-              //delay(5);
-            }
-            flag += 1;
 
+void adjustPIDparams(float KP, float KD = 0, float KI = 0){
+    //Write to an eeprom addres
+    EEPROM.put(0,KP);
+    EEPROM.put(4,KD);
+    EEPROM.put(8,KI);
+    //write from addres to variables
+    EEPROM.get(0,kP);
+    EEPROM.get(4,kD);
+    EEPROM.get(8,kI);
+
+}
+
+
+String btCommunication(void){
+    String Str = "NoData";
+
+    while(Serial1.available())
+        Str = Serial1.readString();    
+
+    return Str;  
+}
+
+void pdControl(uint16_t *s_values,const int goal,double l_error,int max_speed){
+
+    while(true){
+        if(digitalRead(3)==LOW){
+            PORTD &= ~_BV(2);   //digitalWrite(2,LOW);
+            break;
         }
+        uint16_t position = qtr.readLineBlack(s_values);
+        int currentError = goal - position;
+        I = I+currentError;
+        int adjustment = kP*currentError+kD*(currentError-l_error)+kI*I;
+        lastError = currentError;
+        analogWrite(5,constrain(max_speed-adjustment, 0, max_speed));
+        analogWrite(9,constrain(max_speed+adjustment, 0, max_speed));
+    }
+}
+
+void motorStartup(int max_speed){
+
+    for(uint8_t i = 0; i<max_speed; i++){
+        analogWrite(5,i);
+        analogWrite(9,i);
+        delay(10);
+    }
+}
+
+void getPID(){
+    Serial1.print("kP: ");
+    Serial1.print(kP,3);
+    Serial1.print(" kD: ");
+    Serial1.print(kD,3);
+    Serial1.print(" kI: ");
+    Serial1.print(kI,3);
+    Serial1.println();
+}
+
+void setSpeed(uint8_t newMaxSpeed, uint8_t newMotorSpeed){
+    EEPROM.put(20,newMotorSpeed);
+    EEPROM.put(24,newMaxSpeed);
+}
+
+void getSpeed(){
+    uint8_t max=0, motor=0;
+    EEPROM.get(20,motor);
+    EEPROM.get(24,max);
+    Serial1.print("Motor speed: ");
+    Serial1.print(max);
+    Serial1.print(" Max speed: ");
+    Serial1.print(motor);
+    Serial1.println();
+}
+
+void setDefault(){
+    //default speed
+    EEPROM.put(20,150);
+    EEPROM.put(24,100);
+    //default PID variables
+    EEPROM.put(0,5.64);
+    EEPROM.put(4,0.07);
+    EEPROM.put(8,0.26);
+    EEPROM.get(0,kP);
+    EEPROM.get(4,kD);
+    EEPROM.get(8,kI);
     
 }
 
-//odczyt wartości np. jeśli suma = 1 to znaczy, że czujnik q1 widzi linię czyli ten najbardziej z lewej patrząc od tyłu lf-a a pozostałe nie itd.
-void Reading() {
+int convertCommandToValue(String str) {
+    int hash = 0;
+    for(auto x:str)
+        hash += (int)x;
 
-    q1 = digitalRead(Q1) * 1;
-    q2 = digitalRead(Q2) * 10;
-    q3 = digitalRead(Q3) * 100;
-    q4 = digitalRead(Q4) * 1000;
-    q5 = digitalRead(Q5) * 10000;
+    return hash;
+}
 
-    sum = q1 + q2 + q3 + q4 + q5;
+void executeCommand(String str){
+    String command;
+    if(!(str=="NoData")){
+        String bufor;
+        int flag = 0;
+        
+        float P = 0.00f, D = 0.00f, I = 0.00f;
+        
+        for(int i = 0; i<str.length(); i++){//petlaPoKomendzie
+          if (!(str[i] == ' ')) {
+            bufor += str[i];
+            continue;}
+  
+          switch (flag) {
+              case 0:
+                  command = bufor;
+                  break;
 
-  switch(sum){
-    case 0:
-        if (prev_sum == 1)
-            reading = -1000;     
-        else if (prev_sum == 10000)
-            reading = 5000;
-        break;
-    case 100:
-        reading = 2000;
-        break;
-    case 10000:
-        reading = 5000;
-        break;
-    case 1:
-        reading=0;
-        break;
-    case 11:
-        reading = 500;
-        break;
-    case 10:
-        reading=1000;
-        break;
-    case 1000:
-        reading=3000;
-        break;  
-    case 1100:
-        reading=2500;
-        break;
-    case 11000:
-        reading=3500;
-        break;
-    default:
-        reading=777;
+              case 1:
+                  P = bufor.toFloat();
+                  break;
+
+              case 2:
+                  D = bufor.toFloat();
+                  break;
+
+              case 3:
+                  I = bufor.toFloat();
+                  break;
+          }
+          flag++;
+          bufor = "";
+      }
+
+        int commandValue=convertCommandToValue(command);
+        switch(commandValue){
+          case 776://WritePID
+            adjustPIDparams(P,D,I);  
+            break;
+
+          case 935://calibrate
+            calibration();
+            break;
+
+          case 558: //start
+            motorStartup(MOTOR_SPEED);
+            pdControl(sensorValues,goal,lastError,MAX_SPEED);
+            break;
+
+          case 541://getPID
+            getPID();
+            break;
+
+          case 829://setSpeed
+            setSpeed(round(P),round(D));
+            break;
+
+          case 817://getSpeed
+            getSpeed();
+            break;
+
+          case 1041://setDefault
+            setDefault();
+            break;
+/*
+
+          case 1024://getEncoder
+            sendEncoders();
+            break;
+*/
+          default:
+            Serial1.println("No such command!");
+        }
+    }
+     
+}
+
+void setup() {
+  
+  EEPROM.get(0,kP);
+  EEPROM.get(4,kD);
+  EEPROM.get(8,kI);
+
+  MOTOR_SPEED = EEPROM.read(20);
+  MAX_SPEED= EEPROM.read(24);
+  
+  Serial.begin(9600);
+
+  //Bluetooth setup
+  Serial1.begin(9600); 
+  
+  //motor setup 
+  for(uint8_t i = 0; i<sizeof(motor_pins); i++){
+    pinMode(motor_pins[i],OUTPUT);
   }
-    prev_sum = sum;
+  //DRV8833 SLP pin initialization
+  
+  DDRD &= ~_BV(DDD2);     //pinMode(2,OUTPUT);
+  PORTD |= _BV(PORTD2);  //digitalWrite(2,HIGH);
+
+  //button to stop PID
+  pinMode(3,INPUT_PULLUP);
+
+  //rotation direction
+    PORTD &= ~_BV(PORTD6);       //digitalWrite(6,LOW);
+    PORTB &= ~_BV(PORTB2);      //digitalWrite(10,LOW);
+  //sensors setup
+  QTRReadMode::On;
+  qtr.setTypeRC();
+  qtr.setSensorPins((const uint8_t[]){A1, A0, A2, A3, A4, A5, A6, A7}, sensorCount);//A7, A6, A5, A4, A3, A2, A0, A1
+  qtr.setEmitterPin(4);
+
+  DDRB &= ~_BV(DDB5);  //pinMode(LED_BUILTIN, OUTPUT);
+
 }
 
-void Movement() {
-    //spróbować zamiast funkcji constrain() użyć if-ów
-    analogWrite(10, constrain(MOTOR_SPEED - PID, MIN_SPEED, MAX_SPEED));
-    analogWrite(5, constrain(MOTOR_SPEED + PID, MIN_SPEED, MAX_SPEED));
-}
-
-//można pomyśleć nad dodaniem członu całkującego
-void PID_counter() {
-    error = goal - reading;
-    //error = reading;
-    P = error;
-    D = error - previous_error;
-    previous_error = error;
-    PID = (kP * P) + (kD * D);
-}
+void loop() {
+  String instruction = btCommunication();
+  executeCommand(instruction);
+ }
